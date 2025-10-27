@@ -1,279 +1,221 @@
-# 1. объединение имён с <=2 опечатками (Левенштейн)
-# 2. рейтинг участников
-# 3. поиск двух мошенников
-# 4. запись в result.txt с временем выполнения
-
 require 'time'
+require 'amatch'
+include Amatch
 
-FILE_PATH = "votes_42.txt"
-OUTPUT_FILE = "result.txt"
-WINDOW = 3600 # секунд
+FILE_PATH = 'votes_42.txt'
 
-start_time = Time.now
+LEV_MAX = 2
+WINDOW_SECONDS = 3600
+TOP_SHOW = 5
 
-# структуры для объединения
-class UnionFind
-  def initialize
-    @parent = {}
-    @rank = {}
+program_start = Time.now
+
+puts "запуск обработки..."
+
+votes = [] # { raw_name:, time:, ip: }
+File.foreach(FILE_PATH) do |line|
+  # простой парсер
+  if m = line.match(/time:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}:[0-9]{2})/)
+    t = Time.parse(m[1]) rescue nil
+  else
+    t = nil
   end
-  def find(x)
-    @parent[x] ||= x
-    @parent[x] = find(@parent[x]) if @parent[x] != x
-    @parent[x]
+  ip = nil
+  if m = line.match(/ip:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/)
+    ip = m[1]
+  elsif m = line.match(/ip:\s*([^,\s]+)/)
+    ip = m[1]
   end
-  def union(a, b)
-    ra = find(a)
-    rb = find(b)
-    return if ra == rb
-    @rank[ra] ||= 0
-    @rank[rb] ||= 0
-    if @rank[ra] < @rank[rb]
-      @parent[ra] = rb
-    elsif @rank[rb] < @rank[ra]
-      @parent[rb] = ra
-    else
-      @parent[rb] = ra
-      @rank[ra] += 1
-    end
+  candidate = ''
+  if m = line.match(/candidate:\s*(.+?)\s*$/)
+    candidate = m[1].strip
+  elsif m = line.match(/candidate:\s*([^,]+)/)
+    candidate = m[1].strip
   end
+  votes << { raw_name: candidate, time: t, ip: ip }
+end
+puts "прочитано голосов: #{votes.size}"
+
+# частотный подсчёт написаний
+name_counts = Hash.new(0)
+votes.each { |v| name_counts[v[:raw_name]] += 1 }
+unique_names = name_counts.keys
+puts "уникальных написаний: #{unique_names.size}"
+
+# чтобы не создавать объект при каждой проверке, используем кэш
+lev_cache = {} # строка -> amatch::levenshtein объект
+
+def amatch_distance(a, b, lev_cache)
+  sa = a.to_s.downcase
+  sb = b.to_s.downcase
+  return LEV_MAX + 1 if (sa.length - sb.length).abs > LEV_MAX
+  lev = lev_cache[sa]
+  unless lev
+    lev = Amatch::Levenshtein.new(sa)
+    lev_cache[sa] = lev
+  end
+  lev.match(sb).to_i
 end
 
-
-# расстояние Левенштейна с отсечением
-def levenshtein_with_cutoff(a, b, cutoff)
-  diff = (a.length - b.length).abs
-  return cutoff + 1 if diff > cutoff
-  n, m = a.length, b.length
-  return m if n == 0
-  return n if m == 0
-
-  prev = Array.new(m + 1) { |i| i }
-  curr = Array.new(m + 1, 0)
-
-  (1..n).each do |i|
-    curr[0] = i
-    min_in_row = curr[0]
-    ai = a.getbyte(i - 1)
-    (1..m).each do |j|
-      cost = (ai == b.getbyte(j - 1)) ? 0 : 1
-      val = [curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost].min
-      curr[j] = val
-      min_in_row = val if val < min_in_row
-    end
-    return cutoff + 1 if min_in_row > cutoff
-    prev, curr = curr, prev
-  end
-  prev[m]
-end
-
-
-# bk-tree для быстрого поиска похожих имён
 class BKNode
-  attr_reader :word, :children
+  attr_accessor :word, :children
   def initialize(word)
-    @word = word
-    @children = {}
-  end
-  def insert(word)
-    d = levenshtein_with_cutoff(@word, word, 2)
-    if @children[d]
-      @children[d].insert(word)
-    else
-      @children[d] = BKNode.new(word)
-    end
-  end
-  def search(word, threshold, result)
-    d = levenshtein_with_cutoff(@word, word, threshold)
-    result << [@word, d] if d <= threshold
-    ((d - threshold)..(d + threshold)).each do |k|
-      node = @children[k]
-      node.search(word, threshold, result) if node
-    end
+    @word = word  # слово в узле
+    @children = {} # хэш { distance_integer => child_node }
   end
 end
 
 class BKTree
-  def initialize
+  def initialize(&dist_fn)
     @root = nil
+    @dist_fn = dist_fn
   end
-  def insert(word)
+
+  # вставка нового слова
+  # спускаемся от корня по ребрам, помеченным расстоянием
+  # если на найденной дистанции нет ребёнка криейтим узел
+  def insert(term)
     if @root.nil?
-      @root = BKNode.new(word)
-    else
-      @root.insert(word)
+      @root = BKNode.new(term)
+      return
     end
-  end
-  def search(word, threshold)
-    return [] if @root.nil?
-    result = []
-    @root.search(word, threshold, result)
-    result
-  end
-end
-
-
-puts "чтение файла..."
-lines = File.readlines(FILE_PATH)
-
-votes = Hash.new(0)
-times = Hash.new { |h, k| h[k] = [] }
-ips = Hash.new { |h, k| h[k] = Hash.new(0) }
-
-lines.each do |line|
-  if line =~ /candidate:\s*(.+)\s*$/
-    name = $1.strip
-    votes[name] += 1
-
-    if line =~ /time:\s*([^,]+),\s*ip:\s*([^,]+),\s*candidate:/
-      t_str = $1.strip
-      ip = $2.strip
-      begin
-        t = Time.parse(t_str).to_i
-      rescue
-        t = nil
+    node = @root
+    loop do
+      d = @dist_fn.call(term, node.word)
+      if d == 0
+        # уже есть такое слово
+        return
+      elsif node.children[d]
+        node = node.children[d]
+      else
+        node.children[d] = BKNode.new(term)
+        return
       end
-      times[name] << t if t
-      ips[name][ip] += 1
     end
   end
-end
 
-puts "прочитано #{lines.size} строк"
-puts "уникальных имён: #{votes.keys.size}"
-
-
-# точное объединение похожих имён
-bk = BKTree.new
-names = votes.keys
-names.each { |n| bk.insert(n) }
-
-uf = UnionFind.new
-names.each do |n|
-  bk.search(n, 2).each do |w, d|
-    uf.union(n, w) if d <= 2
-  end
-end
-
-clusters = Hash.new { |h, k| h[k] = [] }
-names.each { |n| clusters[uf.find(n)] << n }
-
-canon = {}
-clusters.each do |_, group|
-  best = group.max_by { |x| votes[x] }
-  group.each { |x| canon[x] = best }
-end
-
-final_votes = Hash.new(0)
-final_times = Hash.new { |h, k| h[k] = [] }
-final_ips = Hash.new { |h, k| h[k] = Hash.new(0) }
-variant_map = Hash.new { |h, k| h[k] = [] }
-
-names.each do |n|
-  base = canon[n] || n
-  final_votes[base] += votes[n]
-  final_times[base].concat(times[n])
-  ips[n].each { |ip, c| final_ips[base][ip] += c }
-  variant_map[base] << n unless variant_map[base].include?(n)
-end
-
-ranking = final_votes.sort_by { |_, cnt| -cnt }
-
-
-# поиск читеров
-ip_cheater = ranking.map do |name, _|
-  ip_counts = final_ips[name]
-  max_ip, max_count = ip_counts.max_by { |ip, c| c } || [nil, 0]
-  { name: name, max_ip: max_ip, max_ip_count: max_count, total: final_votes[name] }
-end.max_by { |h| h[:max_ip_count] }
-
-window_cheater = ranking.map do |name, _|
-  arr = final_times[name].compact.sort
-  l = 0
-  max_window = 0
-  arr.each_with_index do |cur, r|
-    while arr[l] < cur - WINDOW
-      l += 1
-      break if l > r
+  # ретёрнит массив [term, distance] для всех терминов в радиусе max_dist
+  def query(term, max_dist)
+    return [] if @root.nil?
+    results = []
+    stack = [@root]
+    while node = stack.pop
+      d = @dist_fn.call(term, node.word)
+      results << [node.word, d] if d <= max_dist
+      low = d - max_dist
+      high = d + max_dist
+      node.children.each do |child_dist, child_node|
+        # если дочернее ребро может привести к искомому диапазону спускаемся ниже
+        if child_dist >= low && child_dist <= high
+          stack << child_node
+        end
+      end
     end
-    window = r - l + 1
-    max_window = window if window > max_window
+    results
   end
-  { name: name, max_window: max_window, total: final_votes[name], unique_ips: final_ips[name].keys.size }
-end.max_by { |h| h[:max_window] }
+end
 
+# канонические имена
+# сортируем уникальные написания по убыванию частоты
+# частые записи будут якорями
 
+bkt = BKTree.new do |x,y|
+  amatch_distance(x, y, lev_cache)
+end
 
+canonical_for = {}   # raw_name => canonical_name
+canonical_count = {} # canonical_name => суммарная частота
+
+unique_names.sort_by { |n| -name_counts[n] }.each do |name|
+  found = bkt.query(name, LEV_MAX)
+  if found.empty?
+    canonical_for[name] = name
+    canonical_count[name] = name_counts[name]
+    bkt.insert(name)
+  else
+    # сначала минимальное расстояние, при одинаковости более частый канон
+    best = found.min_by { |term, d| [d, - (canonical_count[term] || 0)] }
+    rep_name = best[0]
+    canonical_for[name] = rep_name
+    canonical_count[rep_name] = (canonical_count[rep_name] || 0) + name_counts[name]
+  end
+end
+unique_names.each { |n| canonical_for[n] ||= n }
+
+# агрегация по канонам и поиск мошенников
+canon_votes = Hash.new { |h,k| h[k] = [] }
+votes.each do |v|
+  can = canonical_for[v[:raw_name]]
+  canon_votes[can] << { time: v[:time], ip: v[:ip], raw: v[:raw_name] }
+end
+
+results = canon_votes.map do |can, arr|
+  total = arr.size
+  ip_counts = Hash.new(0)
+  arr.each { |e| ip_counts[e[:ip]] += 1 }
+  max_ip, max_ip_count = ip_counts.max_by { |k,v| v } || [nil,0]
+
+  times = arr.map { |e| e[:time] ? e[:time].to_i : 0 }.sort
+  best_window_votes = 0
+  best_window_unique_ips = 0
+  left = 0
+  right = 0
+  n = times.length
+  while left < n
+    t0w = times[left]
+    while right < n && times[right] <= t0w + WINDOW_SECONDS
+      right += 1
+    end
+    window_votes = right - left
+    if window_votes > best_window_votes
+      t_start = t0w
+      t_end = t0w + WINDOW_SECONDS
+      uniq_ips = canon_votes[can].select { |e| e[:time] && e[:time].to_i >= t_start && e[:time].to_i <= t_end }.map { |e| e[:ip] }.uniq.size
+      best_window_votes = window_votes
+      best_window_unique_ips = uniq_ips
+    end
+    left += 1
+  end
+
+  {
+    canonical: can,
+    total: total,
+    max_ip: max_ip,
+    max_ip_count: max_ip_count,
+    best_window_votes: best_window_votes,
+    best_window_unique_ips: best_window_unique_ips
+  }
+end
+
+sorted = results.sort_by { |r| -r[:total] }
 
 puts
-puts "итоговый рейтинг (топ 50):"
-ranking.first(50).each_with_index do |(name, cnt), i|
-  puts "#{i + 1}. #{name.downcase} — #{cnt} голосов"
+puts "топ #{TOP_SHOW} участников:"
+sorted.first(TOP_SHOW).each_with_index do |r, i|
+  puts "#{i+1}. #{r[:canonical].downcase} — #{r[:total]} голосов (макс с одного ip: #{r[:max_ip_count]}, всплеск #{r[:best_window_votes]} голосов за #{WINDOW_SECONDS}с, #{r[:best_window_unique_ips]} уник. ip в этом окне)"
+end
+
+cheat1 = sorted.max_by { |r| r[:max_ip_count] }
+cheat2 = sorted.max_by { |r| r[:best_window_votes] }
+
+puts
+puts "подозреваемый 1 (много голосов с одного ip):"
+if cheat1
+  puts "#{cheat1[:canonical].downcase} — #{cheat1[:total]} всего, #{cheat1[:max_ip_count]} голосов с одного ip (ip: #{cheat1[:max_ip]})"
+else
+  puts "не найдено"
 end
 
 puts
-puts "объединённые варианты имён:"
-variant_map.each do |canon_name, variants|
-  next if variants.size <= 1
-  puts "#{canon_name.downcase} => #{variants.map(&:downcase).join(', ')}"
+puts "подозреваемый 2 (много голосов с разных ip в короткий промежуток):"
+if cheat2
+  puts "#{cheat2[:canonical].downcase} — #{cheat2[:total]} всего, голосов во временном окне #{WINDOW_SECONDS}с: #{cheat2[:best_window_votes]} голосов, #{cheat2[:best_window_unique_ips]} уник. ip"
+else
+  puts "не найдено"
 end
 
+program_end = Time.now
 puts
-puts "подозрительный №1 — накрутка с одного ip:"
-if ip_cheater
-  puts "имя: #{ip_cheater[:name].downcase}"
-  puts "всего голосов: #{ip_cheater[:total]}"
-  puts "максимум голосов с одного ip: #{ip_cheater[:max_ip_count]} (ip: #{ip_cheater[:max_ip]})"
-end
+puts "время выполнения программы: #{(program_end - program_start).round(3)} сек"
 
-puts
-puts "подозрительный №2 — быстрые всплески голосов (окно #{WINDOW} секунд):"
-if window_cheater
-  puts "имя: #{window_cheater[:name].downcase}"
-  puts "всего голосов: #{window_cheater[:total]}"
-  puts "максимум голосов в окне #{WINDOW}с: #{window_cheater[:max_window]}"
-  puts "число уникальных ip: #{window_cheater[:unique_ips]}"
-end
-
-
-
-end_time = Time.now
-elapsed = end_time - start_time
-
-puts
-puts "время выполнения: #{'%.3f' % elapsed} секунд"
-
-
-
-File.open(OUTPUT_FILE, "w") do |f|
-  f.puts "итоговый рейтинг (топ 50):"
-  ranking.first(50).each_with_index do |(name, cnt), i|
-    f.puts "#{i + 1}. #{name.downcase} — #{cnt} голосов"
-  end
-
-  f.puts "\nобъединённые варианты имён:"
-  variant_map.each do |canon_name, variants|
-    next if variants.size <= 1
-    f.puts "#{canon_name.downcase} => #{variants.map(&:downcase).join(', ')}"
-  end
-
-  f.puts "\nподозрительный №1 — накрутка с одного ip:"
-  if ip_cheater
-    f.puts "имя: #{ip_cheater[:name].downcase}"
-    f.puts "всего голосов: #{ip_cheater[:total]}"
-    f.puts "максимум голосов с одного ip: #{ip_cheater[:max_ip_count]} (ip: #{ip_cheater[:max_ip]})"
-  end
-
-  f.puts "\nподозрительный №2 — быстрые всплески голосов (окно #{WINDOW} секунд):"
-  if window_cheater
-    f.puts "имя: #{window_cheater[:name].downcase}"
-    f.puts "всего голосов: #{window_cheater[:total]}"
-    f.puts "максимум голосов в окне #{WINDOW}с: #{window_cheater[:max_window]}"
-    f.puts "число уникальных ip: #{window_cheater[:unique_ips]}"
-  end
-
-  f.puts "\nвремя выполнения: #{'%.3f' % elapsed} секунд"
-end
-
-puts
-puts "результат сохранён в #{OUTPUT_FILE}"
+puts "зе енд"
